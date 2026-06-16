@@ -1,0 +1,1045 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Space Dock — Newtonian Pilot</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #000;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    color: #aef;
+    user-select: none;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    cursor: crosshair;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function () {
+'use strict';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONSTANTS & CONFIG
+// ═══════════════════════════════════════════════════════════════════════════
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+const MAX_LIVES = 3;
+const SHIP_MASS = 1;
+const THRUST_FORCE = 180;       // Newtons (game units)
+const BRAKE_FORCE = 120;
+const ROTATE_SPEED = 3.2;       // rad/s
+const GRAVITY_G = 8000;         // Gravitational constant (game-tuned)
+const DOCK_RADIUS = 28;
+const DOCK_MAX_SPEED = 45;
+const FUEL_CAPACITY = 100;
+const FUEL_BURN_RATE = 22;      // per second while thrusting
+const BRAKE_FUEL_RATE = 14;
+const PARTICLE_LIFE = 0.6;
+const DEATH_DURATION = 1.8;
+const DOCK_ANIM_DURATION = 2.5;
+const HIGH_SCORE_KEY = 'spaceDockHighScore';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VECTOR MATH (2D)
+// ═══════════════════════════════════════════════════════════════════════════
+function vec(x, y) { return { x, y }; }
+function vAdd(a, b) { return vec(a.x + b.x, a.y + b.y); }
+function vSub(a, b) { return vec(a.x - b.x, a.y - b.y); }
+function vScale(v, s) { return vec(v.x * s, v.y * s); }
+function vLen(v) { return Math.hypot(v.x, v.y); }
+function vNorm(v) {
+  const l = vLen(v);
+  return l > 1e-8 ? vec(v.x / l, v.y / l) : vec(0, 0);
+}
+function vDot(a, b) { return a.x * b.x + a.y * b.y; }
+function vRot(v, angle) {
+  const c = Math.cos(angle), s = Math.sin(angle);
+  return vec(v.x * c - v.y * s, v.x * s + v.y * c);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUT
+// ═══════════════════════════════════════════════════════════════════════════
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function thrustHeld() {
+  return keys['ArrowUp'] || keys['KeyW'];
+}
+function brakeHeld() {
+  return keys['Space'];
+}
+function rotateDir() {
+  let d = 0;
+  if (keys['ArrowLeft'] || keys['KeyA']) d -= 1;
+  if (keys['ArrowRight'] || keys['KeyD']) d += 1;
+  return d;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RESIZE & CAMERA
+// ═══════════════════════════════════════════════════════════════════════════
+let W = 800, H = 600;
+function resize() {
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+let cam = vec(0, 0);
+let camZoom = 1;
+
+function worldToScreen(p) {
+  return vec(
+    (p.x - cam.x) * camZoom + W / 2,
+    (p.y - cam.y) * camZoom + H / 2
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STARFIELD (procedural background)
+// ═══════════════════════════════════════════════════════════════════════════
+const stars = [];
+for (let i = 0; i < 400; i++) {
+  stars.push({
+    x: (Math.random() - 0.5) * 12000,
+    y: (Math.random() - 0.5) * 12000,
+    r: Math.random() * 1.8 + 0.3,
+    b: Math.random() * 0.6 + 0.4,
+    tw: Math.random() * Math.PI * 2
+  });
+}
+
+function drawStars(time) {
+  for (const s of stars) {
+    const p = worldToScreen(vec(s.x, s.y));
+    if (p.x < -10 || p.x > W + 10 || p.y < -10 || p.y > H + 10) continue;
+    const flicker = 0.7 + 0.3 * Math.sin(time * 2 + s.tw);
+    ctx.fillStyle = `rgba(200,220,255,${s.b * flicker})`;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, s.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PARTICLES (exhaust, death explosion)
+// ═══════════════════════════════════════════════════════════════════════════
+const particles = [];
+
+function spawnExhaust(shipPos, angle, intensity) {
+  const back = vRot(vec(-1, 0), angle);
+  for (let i = 0; i < 3; i++) {
+    const spread = (Math.random() - 0.5) * 0.5;
+    const dir = vRot(back, spread);
+    particles.push({
+      x: shipPos.x + dir.x * 8,
+      y: shipPos.y + dir.y * 8,
+      vx: dir.x * (40 + Math.random() * 30) - shipVel.x * 0.2,
+      vy: dir.y * (40 + Math.random() * 30) - shipVel.y * 0.2,
+      life: PARTICLE_LIFE * (0.5 + Math.random() * 0.5),
+      maxLife: PARTICLE_LIFE,
+      color: `hsl(${20 + Math.random() * 30},100%,${50 + Math.random() * 20}%)`,
+      size: 2 + Math.random() * 2
+    });
+  }
+}
+
+function spawnDeathBurst(pos) {
+  for (let i = 0; i < 40; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const spd = 30 + Math.random() * 120;
+    particles.push({
+      x: pos.x, y: pos.y,
+      vx: Math.cos(a) * spd, vy: Math.sin(a) * spd,
+      life: 0.8 + Math.random() * 0.8,
+      maxLife: 1.6,
+      color: `hsl(${Math.random() * 40},100%,60%)`,
+      size: 2 + Math.random() * 4
+    });
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= 0.98;
+    p.vy *= 0.98;
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const alpha = p.life / p.maxLife;
+    const s = worldToScreen(vec(p.x, p.y));
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, p.size * camZoom, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHYSICS — NEWTONIAN MODEL
+// F = ma  →  a = F/m
+// Gravity: F = G·M·m / r²  →  a_grav = G·M / r²  (toward mass center)
+// Integration: semi-implicit Euler — v += a·dt, x += v·dt
+// ═══════════════════════════════════════════════════════════════════════════
+let shipPos = vec(0, 0);
+let shipVel = vec(0, 0);
+let shipAngle = 0;
+let shipFuel = FUEL_CAPACITY;
+let shipAlive = true;
+
+function resetShip(start) {
+  shipPos = vec(start.x, start.y);
+  shipVel = vec(0, 0);
+  shipAngle = start.angle ?? -Math.PI / 2;
+  shipFuel = FUEL_CAPACITY;
+  shipAlive = true;
+}
+
+function computeGravityAccel(pos, planets) {
+  // Sum gravitational acceleration from each planet.
+  // a = G·M / r² along unit vector toward planet center.
+  let ax = 0, ay = 0;
+  for (const pl of planets) {
+    const dx = pl.x - pos.x;
+    const dy = pl.y - pos.y;
+    const rSq = dx * dx + dy * dy;
+    const r = Math.sqrt(rSq);
+    if (r < pl.radius * 0.5) continue; // avoid singularity inside core
+    const aMag = (GRAVITY_G * pl.mass) / rSq;
+    ax += (dx / r) * aMag;
+    ay += (dy / r) * aMag;
+  }
+  return vec(ax, ay);
+}
+
+function updateShipPhysics(dt, planets) {
+  if (!shipAlive) return;
+
+  let ax = 0, ay = 0;
+
+  // Gravitational acceleration
+  const grav = computeGravityAccel(shipPos, planets);
+  ax += grav.x;
+  ay += grav.y;
+
+  // Thrust: force applied along ship nose direction
+  // F_thrust = thrustMag · unit(forward),  a = F/m
+  if (thrustHeld() && shipFuel > 0) {
+    const forward = vRot(vec(1, 0), shipAngle);
+    ax += (forward.x * THRUST_FORCE) / SHIP_MASS;
+    ay += (forward.y * THRUST_FORCE) / SHIP_MASS;
+    shipFuel = Math.max(0, shipFuel - FUEL_BURN_RATE * dt);
+    spawnExhaust(shipPos, shipAngle, 1);
+  }
+
+  // Brake: oppose current velocity (retro-thrust)
+  if (brakeHeld() && shipFuel > 0 && vLen(shipVel) > 1) {
+    const brakeDir = vNorm(vScale(shipVel, -1));
+    ax += (brakeDir.x * BRAKE_FORCE) / SHIP_MASS;
+    ay += (brakeDir.y * BRAKE_FORCE) / SHIP_MASS;
+    shipFuel = Math.max(0, shipFuel - BRAKE_FUEL_RATE * dt);
+    spawnExhaust(shipPos, Math.atan2(shipVel.y, shipVel.x), 0.5);
+  }
+
+  // Rotation (not torque physics — arcade-friendly steering)
+  shipAngle += rotateDir() * ROTATE_SPEED * dt;
+
+  // Integrate velocity and position
+  shipVel.x += ax * dt;
+  shipVel.y += ay * dt;
+  shipPos.x += shipVel.x * dt;
+  shipPos.y += shipVel.y * dt;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COLLISION DETECTION
+// Circle-circle: dist(centerA, centerB) < rA + rB
+// Point in circle: dist(point, center) < radius
+// ═══════════════════════════════════════════════════════════════════════════
+const SHIP_RADIUS = 10;
+
+function circleHit(ax, ay, ar, bx, by, br) {
+  const dx = ax - bx, dy = ay - by;
+  return dx * dx + dy * dy < (ar + br) * (ar + br);
+}
+
+function checkCollisions(level) {
+  if (!shipAlive) return null;
+
+  // Planet surface collision
+  for (const pl of level.planets) {
+    const dx = shipPos.x - pl.x;
+    const dy = shipPos.y - pl.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < pl.radius + SHIP_RADIUS * 0.6) return 'planet';
+  }
+
+  // Asteroid collision
+  for (const ast of level.asteroids) {
+    if (circleHit(shipPos.x, shipPos.y, SHIP_RADIUS, ast.x, ast.y, ast.r)) {
+      return 'asteroid';
+    }
+  }
+
+  // Docking success
+  const dock = level.dock;
+  const ddx = shipPos.x - dock.x;
+  const ddy = shipPos.y - dock.y;
+  const dockDist = Math.hypot(ddx, ddy);
+  const speed = vLen(shipVel);
+  if (dockDist < DOCK_RADIUS && speed < DOCK_MAX_SPEED) {
+    return 'dock';
+  }
+
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DRAWING ROUTINES (all procedural — no external assets)
+// ═══════════════════════════════════════════════════════════════════════════
+function drawPlanet(pl, time) {
+  const p = worldToScreen(vec(pl.x, pl.y));
+  const r = pl.radius * camZoom;
+  if (p.x + r < -50 || p.x - r > W + 50 || p.y + r < -50 || p.y - r > H + 50) return;
+
+  // Gravity well glow
+  const grad = ctx.createRadialGradient(p.x, p.y, r * 0.8, p.x, p.y, r * 2.2);
+  grad.addColorStop(0, 'rgba(80,120,255,0.08)');
+  grad.addColorStop(1, 'rgba(80,120,255,0)');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r * 2.2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Planet body
+  const bodyGrad = ctx.createRadialGradient(p.x - r * 0.3, p.y - r * 0.3, r * 0.1, p.x, p.y, r);
+  bodyGrad.addColorStop(0, pl.colorLight || '#8af');
+  bodyGrad.addColorStop(0.6, pl.color || '#468');
+  bodyGrad.addColorStop(1, pl.colorDark || '#124');
+  ctx.fillStyle = bodyGrad;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Surface craters (deterministic from mass seed)
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+  ctx.clip();
+  const seed = pl.mass * 17.3;
+  for (let i = 0; i < 6; i++) {
+    const ang = seed * (i + 1) * 1.7;
+    const cr = r * (0.08 + (i % 3) * 0.04);
+    const cx = p.x + Math.cos(ang) * r * 0.5;
+    const cy = p.y + Math.sin(ang) * r * 0.45;
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.beginPath();
+    ctx.arc(cx, cy, cr, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // Atmosphere ring
+  ctx.strokeStyle = 'rgba(150,200,255,0.25)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r + 3, 0, Math.PI * 2);
+  ctx.stroke();
+}
+
+function drawAsteroid(ast, time) {
+  const p = worldToScreen(vec(ast.x, ast.y));
+  const r = ast.r * camZoom;
+  if (p.x + r < -20 || p.x - r > W + 20) return;
+
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(ast.rot + time * ast.spin);
+
+  const n = ast.verts.length;
+  ctx.fillStyle = '#6a5a4a';
+  ctx.strokeStyle = '#3a2a1a';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const v = ast.verts[i];
+    const vx = v.x * r, vy = v.y * r;
+    if (i === 0) ctx.moveTo(vx, vy);
+    else ctx.lineTo(vx, vy);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Highlight facet
+  ctx.fillStyle = 'rgba(255,255,255,0.08)';
+  ctx.beginPath();
+  ctx.moveTo(ast.verts[0].x * r, ast.verts[0].y * r);
+  ctx.lineTo(ast.verts[1].x * r, ast.verts[1].y * r);
+  ctx.lineTo(ast.verts[2].x * r, ast.verts[2].y * r);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.restore();
+}
+
+function makeAsteroidVerts(seed) {
+  const verts = [];
+  const sides = 7 + Math.floor(seed % 4);
+  for (let i = 0; i < sides; i++) {
+    const ang = (i / sides) * Math.PI * 2;
+    const jitter = 0.65 + ((seed * (i + 1) * 13.7) % 100) / 200;
+    verts.push(vec(Math.cos(ang) * jitter, Math.sin(ang) * jitter));
+  }
+  return verts;
+}
+
+function drawDock(dock, time) {
+  const p = worldToScreen(vec(dock.x, dock.y));
+  const pulse = 0.5 + 0.5 * Math.sin(time * 4);
+
+  // Docking zone ring
+  ctx.strokeStyle = `rgba(0,255,180,${0.3 + pulse * 0.3})`;
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 6]);
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, DOCK_RADIUS * camZoom, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Station structure — hexagonal platform
+  const r = 18 * camZoom;
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(time * 0.5);
+  ctx.fillStyle = '#2a4a5a';
+  ctx.strokeStyle = '#0f8';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2 - Math.PI / 2;
+    const x = Math.cos(a) * r, y = Math.sin(a) * r;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Central beacon
+  ctx.fillStyle = `rgba(0,255,150,${0.6 + pulse * 0.4})`;
+  ctx.beginPath();
+  ctx.arc(0, 0, 5 * camZoom, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Approach arrow hint
+  ctx.fillStyle = 'rgba(0,255,180,0.5)';
+  ctx.font = `${11 * camZoom}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText('DOCK', p.x, p.y - DOCK_RADIUS * camZoom - 8);
+}
+
+function drawShip(time) {
+  if (!shipAlive) return;
+  const p = worldToScreen(shipPos);
+  const s = camZoom;
+
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(shipAngle);
+
+  // Engine glow when thrusting
+  if (thrustHeld() && shipFuel > 0) {
+    ctx.fillStyle = 'rgba(255,120,30,0.6)';
+    ctx.beginPath();
+    ctx.moveTo(-14 * s, 0);
+    ctx.lineTo(-22 * s, -4 * s);
+    ctx.lineTo(-22 * s, 4 * s);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Hull — triangular wedge
+  ctx.fillStyle = '#cde';
+  ctx.strokeStyle = '#8af';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(14 * s, 0);
+  ctx.lineTo(-10 * s, -9 * s);
+  ctx.lineTo(-6 * s, 0);
+  ctx.lineTo(-10 * s, 9 * s);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Cockpit
+  ctx.fillStyle = '#48f';
+  ctx.beginPath();
+  ctx.arc(4 * s, 0, 3 * s, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Wing details
+  ctx.strokeStyle = '#6ac';
+  ctx.beginPath();
+  ctx.moveTo(-2 * s, -9 * s);
+  ctx.lineTo(-8 * s, -9 * s);
+  ctx.moveTo(-2 * s, 9 * s);
+  ctx.lineTo(-8 * s, 9 * s);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawStartMarker(start) {
+  const p = worldToScreen(vec(start.x, start.y));
+  ctx.strokeStyle = 'rgba(255,255,100,0.4)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 20 * camZoom, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = 'rgba(255,255,100,0.6)';
+  ctx.font = `${10 * camZoom}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText('START', p.x, p.y - 26 * camZoom);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HUD
+// ═══════════════════════════════════════════════════════════════════════════
+function drawHUD(levelIndex, lives, score, state) {
+  const speed = vLen(shipVel);
+  const pad = 16;
+
+  ctx.fillStyle = 'rgba(0,10,30,0.75)';
+  ctx.fillRect(0, 0, W, 52);
+  ctx.fillRect(0, H - 36, W, 36);
+
+  ctx.font = '14px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#8cf';
+  ctx.fillText(`LEVEL ${levelIndex + 1}/10`, pad, 22);
+  ctx.fillText(`VEL ${speed.toFixed(1)} u/s`, pad, 42);
+
+  // Fuel bar
+  const barX = 160, barW = 120, barH = 12;
+  ctx.fillStyle = '#234';
+  ctx.fillRect(barX, 14, barW, barH);
+  const fuelPct = shipFuel / FUEL_CAPACITY;
+  ctx.fillStyle = fuelPct > 0.25 ? '#0c8' : '#f44';
+  ctx.fillRect(barX, 14, barW * fuelPct, barH);
+  ctx.strokeStyle = '#8cf';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(barX, 14, barW, barH);
+  ctx.fillStyle = '#8cf';
+  ctx.fillText('FUEL', barX, 42);
+
+  // Lives
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#f88';
+  let livesStr = '';
+  for (let i = 0; i < lives; i++) livesStr += '▲ ';
+  ctx.fillText(livesStr, W - pad, 22);
+  ctx.fillStyle = '#fc8';
+  ctx.fillText(`SCORE ${score}`, W - pad, 42);
+
+  // Controls hint
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(140,200,255,0.5)';
+  ctx.font = '11px monospace';
+  ctx.fillText('WASD/Arrows: steer & thrust  |  SPACE: brake  |  R: restart level', W / 2, H - 12);
+
+  if (state === 'dead') {
+    ctx.fillStyle = 'rgba(200,40,40,0.85)';
+    ctx.font = 'bold 22px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('HULL BREACH — RESPAWNING...', W / 2, H / 2);
+  }
+  if (state === 'docked') {
+    ctx.fillStyle = 'rgba(0,255,150,0.9)';
+    ctx.font = 'bold 26px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('DOCKING COMPLETE', W / 2, H / 2 - 20);
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#8cf';
+    ctx.fillText('Preparing next sector...', W / 2, H / 2 + 14);
+  }
+}
+
+function drawMenu(title, subtitle, hint) {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#0ff';
+  ctx.font = 'bold 42px monospace';
+  ctx.fillText(title, W / 2, H / 2 - 60);
+  ctx.fillStyle = '#8cf';
+  ctx.font = '18px monospace';
+  ctx.fillText(subtitle, W / 2, H / 2);
+  ctx.fillStyle = 'rgba(200,220,255,0.6)';
+  ctx.font = '14px monospace';
+  ctx.fillText(hint, W / 2, H / 2 + 50);
+  const hs = getHighScore();
+  if (hs > 0) {
+    ctx.fillStyle = '#fc8';
+    ctx.fillText(`HIGH SCORE: ${hs}`, W / 2, H / 2 + 80);
+  }
+}
+
+function drawGameOver(score) {
+  ctx.fillStyle = 'rgba(20,0,0,0.85)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#f44';
+  ctx.font = 'bold 40px monospace';
+  ctx.fillText('MISSION FAILED', W / 2, H / 2 - 40);
+  ctx.fillStyle = '#fc8';
+  ctx.font = '22px monospace';
+  ctx.fillText(`FINAL SCORE: ${score}`, W / 2, H / 2 + 10);
+  const hs = getHighScore();
+  ctx.fillStyle = '#8cf';
+  ctx.fillText(`HIGH SCORE: ${hs}`, W / 2, H / 2 + 45);
+  ctx.fillStyle = 'rgba(200,220,255,0.6)';
+  ctx.font = '14px monospace';
+  ctx.fillText('Press ENTER to try again', W / 2, H / 2 + 90);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HIGH SCORE (localStorage)
+// ═══════════════════════════════════════════════════════════════════════════
+function getHighScore() {
+  try { return parseInt(localStorage.getItem(HIGH_SCORE_KEY) || '0', 10); }
+  catch { return 0; }
+}
+function saveHighScore(score) {
+  try {
+    const prev = getHighScore();
+    if (score > prev) localStorage.setItem(HIGH_SCORE_KEY, String(score));
+  } catch {}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LEVEL DEFINITIONS — 10 handcrafted layouts, increasing difficulty
+// Each level: start, dock, planets[{x,y,radius,mass,color...}], asteroids[{x,y,r}]
+// ═══════════════════════════════════════════════════════════════════════════
+function buildLevels() {
+  const levels = [];
+
+  // Level 1 — Tutorial: gentle curve around one distant planet
+  levels.push({
+    name: 'Shakedown',
+    start: { x: -200, y: 0, angle: 0 },
+    dock: { x: 400, y: 0 },
+    camZoom: 0.85,
+    planets: [
+      { x: 100, y: -280, radius: 70, mass: 120, color: '#468', colorLight: '#8cf', colorDark: '#124' }
+    ],
+    asteroids: []
+  });
+
+  // Level 2 — Gravity assist intro: two planets
+  levels.push({
+    name: 'Twin Worlds',
+    start: { x: -350, y: 150, angle: -0.3 },
+    dock: { x: 450, y: -200 },
+    camZoom: 0.75,
+    planets: [
+      { x: 0, y: 200, radius: 55, mass: 90, color: '#646', colorLight: '#c8c', colorDark: '#212' },
+      { x: 200, y: -150, radius: 80, mass: 140, color: '#486', colorLight: '#8da', colorDark: '#142' }
+    ],
+    asteroids: [
+      { x: 100, y: 0, r: 14 }, { x: 250, y: 50, r: 12 }
+    ]
+  });
+
+  // Level 3 — First asteroid field
+  levels.push({
+    name: 'Debris Field',
+    start: { x: -400, y: 0, angle: 0 },
+    dock: { x: 500, y: 100 },
+    camZoom: 0.7,
+    planets: [
+      { x: 50, y: -250, radius: 65, mass: 110, color: '#864', colorLight: '#da8', colorDark: '#321' }
+    ],
+    asteroids: [
+      { x: -100, y: -80, r: 16 }, { x: 0, y: 40, r: 14 }, { x: 120, y: -30, r: 18 },
+      { x: 250, y: 60, r: 15 }, { x: 350, y: -50, r: 13 }, { x: 180, y: 120, r: 17 }
+    ]
+  });
+
+  // Level 4 — Narrow passage between two planets
+  levels.push({
+    name: 'The Gauntlet',
+    start: { x: -300, y: 0, angle: 0 },
+    dock: { x: 400, y: 0 },
+    camZoom: 0.65,
+    planets: [
+      { x: 50, y: -120, radius: 90, mass: 180, color: '#448', colorLight: '#88f', colorDark: '#112' },
+      { x: 50, y: 120, radius: 90, mass: 180, color: '#484', colorLight: '#8f8', colorDark: '#121' }
+    ],
+    asteroids: [
+      { x: 50, y: 0, r: 12 }, { x: 150, y: -40, r: 14 }, { x: 150, y: 40, r: 14 },
+      { x: 250, y: 0, r: 16 }
+    ]
+  });
+
+  // Level 5 — Three-body problem lite
+  levels.push({
+    name: 'Lagrange Run',
+    start: { x: -450, y: 200, angle: -0.5 },
+    dock: { x: 500, y: -250 },
+    camZoom: 0.6,
+    planets: [
+      { x: -50, y: -100, radius: 60, mass: 100, color: '#666', colorLight: '#ccc', colorDark: '#222' },
+      { x: 200, y: 100, radius: 75, mass: 130, color: '#846', colorLight: '#c8a', colorDark: '#312' },
+      { x: 100, y: -280, radius: 50, mass: 80, color: '#468', colorLight: '#8cf', colorDark: '#124' }
+    ],
+    asteroids: [
+      { x: 0, y: 50, r: 15 }, { x: 100, y: -50, r: 13 }, { x: 300, y: 0, r: 18 },
+      { x: 350, y: -150, r: 14 }, { x: 200, y: -100, r: 16 }
+    ]
+  });
+
+  // Level 6 — Close gravity well at start
+  levels.push({
+    name: 'Perigee',
+    start: { x: -180, y: 0, angle: 0.2 },
+    dock: { x: 550, y: 0 },
+    camZoom: 0.65,
+    planets: [
+      { x: -80, y: 0, radius: 95, mass: 220, color: '#822', colorLight: '#f66', colorDark: '#300' },
+      { x: 350, y: -200, radius: 55, mass: 90, color: '#486', colorLight: '#8da', colorDark: '#142' }
+    ],
+    asteroids: [
+      { x: 100, y: 80, r: 14 }, { x: 200, y: -60, r: 16 }, { x: 300, y: 40, r: 15 },
+      { x: 400, y: -80, r: 13 }, { x: 450, y: 60, r: 17 }
+    ]
+  });
+
+  // Level 7 — Dense asteroid belt
+  levels.push({
+    name: 'Belt Crossing',
+    start: { x: -500, y: 0, angle: 0 },
+    dock: { x: 550, y: 0 },
+    camZoom: 0.55,
+    planets: [
+      { x: 0, y: -320, radius: 70, mass: 120, color: '#864', colorLight: '#da8', colorDark: '#321' },
+      { x: 0, y: 320, radius: 70, mass: 120, color: '#648', colorLight: '#a8c', colorDark: '#213' }
+    ],
+    asteroids: [
+      { x: -200, y: -60, r: 14 }, { x: -150, y: 40, r: 16 }, { x: -80, y: -30, r: 13 },
+      { x: -20, y: 50, r: 15 }, { x: 40, y: -40, r: 17 }, { x: 100, y: 20, r: 14 },
+      { x: 160, y: -50, r: 16 }, { x: 220, y: 35, r: 13 }, { x: 280, y: -25, r: 15 },
+      { x: 340, y: 45, r: 14 }, { x: 400, y: -35, r: 16 }, { x: 460, y: 15, r: 13 }
+    ]
+  });
+
+  // Level 8 — Slingshot around massive planet
+  levels.push({
+    name: 'Slingshot',
+    start: { x: -400, y: -300, angle: 0.8 },
+    dock: { x: 500, y: 300 },
+    camZoom: 0.5,
+    planets: [
+      { x: 0, y: 0, radius: 130, mass: 350, color: '#468', colorLight: '#adf', colorDark: '#023' },
+      { x: 450, y: -100, radius: 45, mass: 60, color: '#666', colorLight: '#aaa', colorDark: '#222' }
+    ],
+    asteroids: [
+      { x: -150, y: -100, r: 15 }, { x: -80, y: 150, r: 14 }, { x: 200, y: -200, r: 16 },
+      { x: 250, y: 100, r: 13 }, { x: 350, y: 200, r: 15 }, { x: 400, y: 0, r: 14 }
+    ]
+  });
+
+  // Level 9 — Complex multi-planet maze
+  levels.push({
+    name: 'Helix Route',
+    start: { x: -550, y: 0, angle: 0 },
+    dock: { x: 600, y: 0 },
+    camZoom: 0.48,
+    planets: [
+      { x: -200, y: -180, radius: 65, mass: 110, color: '#486', colorLight: '#8da', colorDark: '#142' },
+      { x: -100, y: 200, radius: 70, mass: 115, color: '#864', colorLight: '#da8', colorDark: '#321' },
+      { x: 150, y: -150, radius: 80, mass: 140, color: '#448', colorLight: '#88f', colorDark: '#112' },
+      { x: 250, y: 180, radius: 60, mass: 100, color: '#646', colorLight: '#c8c', colorDark: '#212' },
+      { x: 400, y: -80, radius: 55, mass: 85, color: '#468', colorLight: '#8cf', colorDark: '#124' }
+    ],
+    asteroids: [
+      { x: -300, y: 0, r: 14 }, { x: -150, y: 0, r: 15 }, { x: 0, y: -80, r: 16 },
+      { x: 0, y: 80, r: 14 }, { x: 150, y: 0, r: 15 }, { x: 300, y: -50, r: 13 },
+      { x: 350, y: 50, r: 16 }, { x: 500, y: 0, r: 14 }
+    ]
+  });
+
+  // Level 10 — Final challenge
+  levels.push({
+    name: 'Deep Void',
+    start: { x: -600, y: 250, angle: -0.4 },
+    dock: { x: 650, y: -300 },
+    camZoom: 0.42,
+    planets: [
+      { x: -300, y: 0, radius: 90, mass: 200, color: '#822', colorLight: '#f66', colorDark: '#300' },
+      { x: -50, y: -250, radius: 75, mass: 130, color: '#468', colorLight: '#8cf', colorDark: '#124' },
+      { x: 100, y: 200, radius: 85, mass: 160, color: '#648', colorLight: '#a8c', colorDark: '#213' },
+      { x: 300, y: -100, radius: 100, mass: 240, color: '#448', colorLight: '#88f', colorDark: '#112' },
+      { x: 450, y: 150, radius: 65, mass: 110, color: '#864', colorLight: '#da8', colorDark: '#321' }
+    ],
+    asteroids: [
+      { x: -450, y: 100, r: 15 }, { x: -350, y: -100, r: 14 }, { x: -200, y: 150, r: 16 },
+      { x: -100, y: -50, r: 13 }, { x: 0, y: 50, r: 15 }, { x: 50, y: -100, r: 14 },
+      { x: 150, y: 80, r: 16 }, { x: 200, y: -150, r: 13 }, { x: 280, y: 50, r: 15 },
+      { x: 350, y: -200, r: 14 }, { x: 400, y: 0, r: 16 }, { x: 500, y: -100, r: 13 },
+      { x: 550, y: 100, r: 15 }, { x: 600, y: -200, r: 14 }
+    ]
+  });
+
+  // Bake asteroid vertex data
+  for (const lv of levels) {
+    lv.asteroids = lv.asteroids.map((a, i) => ({
+      x: a.x, y: a.y, r: a.r,
+      verts: makeAsteroidVerts(a.x * 3.7 + a.y * 2.1 + i),
+      rot: (a.x + a.y) * 0.01,
+      spin: 0.15 + (i % 5) * 0.05
+    }));
+  }
+  return levels;
+}
+
+const LEVELS = buildLevels();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAME STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════════════
+let gameState = 'menu'; // menu | playing | dead | docked | victory | gameover
+let levelIndex = 0;
+let lives = MAX_LIVES;
+let score = 0;
+let deathTimer = 0;
+let dockTimer = 0;
+let currentLevel = null;
+let dockAnimPhase = 0;
+
+function loadLevel(idx) {
+  levelIndex = idx;
+  currentLevel = LEVELS[idx];
+  camZoom = currentLevel.camZoom;
+  resetShip(currentLevel.start);
+  particles.length = 0;
+  cam = vec(shipPos.x, shipPos.y);
+}
+
+function startGame() {
+  levelIndex = 0;
+  lives = MAX_LIVES;
+  score = 0;
+  loadLevel(0);
+  gameState = 'playing';
+}
+
+function respawnShip() {
+  resetShip(currentLevel.start);
+  particles.length = 0;
+  gameState = 'playing';
+}
+
+function killShip() {
+  if (!shipAlive) return;
+  shipAlive = false;
+  spawnDeathBurst(shipPos);
+  lives--;
+  score = Math.max(0, score - 50);
+  deathTimer = DEATH_DURATION;
+  gameState = 'dead';
+}
+
+function completeLevel() {
+  gameState = 'docked';
+  dockTimer = DOCK_ANIM_DURATION;
+  dockAnimPhase = 0;
+  const fuelBonus = Math.floor(shipFuel * 2);
+  const speedBonus = Math.max(0, Math.floor((DOCK_MAX_SPEED - vLen(shipVel)) * 3));
+  score += 500 + fuelBonus + speedBonus + levelIndex * 100;
+  saveHighScore(score);
+}
+
+function nextLevel() {
+  if (levelIndex >= LEVELS.length - 1) {
+    gameState = 'victory';
+    saveHighScore(score);
+    return;
+  }
+  loadLevel(levelIndex + 1);
+  gameState = 'playing';
+}
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Enter') {
+    if (gameState === 'menu' || gameState === 'victory' || gameState === 'gameover') {
+      startGame();
+    }
+  }
+  if (e.code === 'KeyR' && (gameState === 'playing' || gameState === 'dead')) {
+    respawnShip();
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CAMERA — smooth follow ship
+// ═══════════════════════════════════════════════════════════════════════════
+function updateCamera(dt) {
+  const target = shipAlive ? shipPos : cam;
+  const lerp = 1 - Math.pow(0.001, dt);
+  cam.x += (target.x - cam.x) * lerp;
+  cam.y += (target.y - cam.y) * lerp;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN GAME LOOP — requestAnimationFrame @ ~60fps
+// ═══════════════════════════════════════════════════════════════════════════
+let lastTime = 0;
+
+function gameLoop(timestamp) {
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+  lastTime = timestamp;
+  const time = timestamp / 1000;
+
+  // Clear frame
+  ctx.fillStyle = '#020818';
+  ctx.fillRect(0, 0, W, H);
+
+  drawStars(time);
+
+  if (gameState === 'menu') {
+    drawStars(time + 100);
+    drawMenu('SPACE DOCK', 'Newtonian Navigation Simulator', 'Press ENTER to launch');
+    requestAnimationFrame(gameLoop);
+    return;
+  }
+
+  if (gameState === 'gameover') {
+    drawGameOver(score);
+    requestAnimationFrame(gameLoop);
+    return;
+  }
+
+  if (gameState === 'victory') {
+    drawMenu('MISSION COMPLETE', `All sectors cleared! Score: ${score}`, 'Press ENTER to play again');
+    requestAnimationFrame(gameLoop);
+    return;
+  }
+
+  // Active level rendering
+  const lv = currentLevel;
+
+  // Physics update
+  if (gameState === 'playing') {
+    updateShipPhysics(dt, lv.planets);
+    const hit = checkCollisions(lv);
+    if (hit === 'planet' || hit === 'asteroid') killShip();
+    else if (hit === 'dock') completeLevel();
+  }
+
+  if (gameState === 'dead') {
+    deathTimer -= dt;
+    updateParticles(dt);
+    if (deathTimer <= 0) {
+      if (lives <= 0) {
+        gameState = 'gameover';
+        saveHighScore(score);
+      } else {
+        respawnShip();
+      }
+    }
+  }
+
+  if (gameState === 'docked') {
+    dockTimer -= dt;
+    dockAnimPhase += dt;
+    // Gentle ship settle animation toward dock
+    const dock = lv.dock;
+    const t = Math.min(1, dockAnimPhase / DOCK_ANIM_DURATION);
+    shipPos.x += (dock.x - shipPos.x) * 0.04;
+    shipPos.y += (dock.y - shipPos.y) * 0.04;
+    shipVel = vScale(shipVel, 0.92);
+    // Victory particles
+    if (Math.random() < 0.3) {
+      particles.push({
+        x: dock.x + (Math.random() - 0.5) * 40,
+        y: dock.y + (Math.random() - 0.5) * 40,
+        vx: (Math.random() - 0.5) * 20,
+        vy: -20 - Math.random() * 30,
+        life: 0.5 + Math.random() * 0.5,
+        maxLife: 1,
+        color: `rgba(0,255,${150 + Math.random() * 100},1)`,
+        size: 2 + Math.random() * 2
+      });
+    }
+    updateParticles(dt);
+    if (dockTimer <= 0) nextLevel();
+  } else {
+    updateParticles(dt);
+  }
+
+  updateCamera(dt);
+
+  // Draw level entities
+  drawStartMarker(lv.start);
+  for (const pl of lv.planets) drawPlanet(pl, time);
+  for (const ast of lv.asteroids) drawAsteroid(ast, time);
+  drawDock(lv.dock, time);
+  drawShip(time);
+  drawParticles();
+
+  // Dock complete ring burst
+  if (gameState === 'docked') {
+    const dp = worldToScreen(vec(lv.dock.x, lv.dock.y));
+    const expand = dockAnimPhase * 30 * camZoom;
+    ctx.strokeStyle = `rgba(0,255,180,${1 - dockAnimPhase / DOCK_ANIM_DURATION})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(dp.x, dp.y, DOCK_RADIUS * camZoom + expand, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  drawHUD(levelIndex, lives, score, gameState);
+
+  requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+
+})();
+</script>
+</body>
+</html>
